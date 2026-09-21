@@ -88,14 +88,21 @@
   /* ---------- Tabs ---------- */
   var navBtns = document.querySelectorAll(".navbtn");
   var panels = document.querySelectorAll(".tab-panel");
+  function showTab(name){
+    var panel = document.querySelector('.tab-panel[data-tab="'+name+'"]');
+    if(!panel) return;
+    navBtns.forEach(function(b){ b.classList.toggle("active", b.dataset.tab === name); });
+    panels.forEach(function(p){ p.classList.remove("active"); });
+    panel.classList.add("active");
+  }
   navBtns.forEach(function(btn){
-    btn.addEventListener("click", function(){
-      navBtns.forEach(function(b){ b.classList.remove("active"); });
-      panels.forEach(function(p){ p.classList.remove("active"); });
-      btn.classList.add("active");
-      document.querySelector('.tab-panel[data-tab="'+btn.dataset.tab+'"]').classList.add("active");
-    });
+    btn.addEventListener("click", function(){ showTab(btn.dataset.tab); });
   });
+  /* manifest shortcuts land on ./?tab=todo and friends */
+  try{
+    var startTab = new URLSearchParams(location.search).get("tab");
+    if(startTab) showTab(startTab);
+  }catch(e){}
 
   /* ---------- Greeting / clock ---------- */
   function updateGreeting(){
@@ -928,5 +935,33 @@
     backdrop.addEventListener("click", function(e){
       if(e.target === backdrop) backdrop.classList.remove("show");
     });
+  });
+
+  /* ---------- PWA ---------- */
+  if("serviceWorker" in navigator){
+    navigator.serviceWorker.register("sw.js").catch(function(){ /* offline support is optional */ });
+  }
+
+  var installEvent = null;
+  var installBtn = document.getElementById("btnInstall");
+  window.addEventListener("beforeinstallprompt", function(e){
+    e.preventDefault();
+    installEvent = e;
+    if(installBtn) installBtn.hidden = false;
+  });
+  if(installBtn){
+    installBtn.addEventListener("click", function(){
+      if(!installEvent) return;
+      installEvent.prompt();
+      installEvent.userChoice.then(function(){
+        installEvent = null;
+        installBtn.hidden = true;
+      });
+    });
+  }
+  window.addEventListener("appinstalled", function(){
+    installEvent = null;
+    if(installBtn) installBtn.hidden = true;
+    toast("앱으로 설치했어요");
   });
 })();

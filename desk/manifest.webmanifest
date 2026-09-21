@@ -1,0 +1,62 @@
+{
+  "name": "estdesk",
+  "short_name": "estdesk",
+  "description": "개인 업무용 대시보드 — 할일, 캘린더, 업무일지, 메모",
+  "lang": "ko",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "id": "/idesk/desk/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#FDF4F3",
+  "theme_color": "#FDF4F3",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "할일",
+      "short_name": "할일",
+      "url": "./?tab=todo",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "캘린더",
+      "short_name": "캘린더",
+      "url": "./?tab=calendar",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "업무일지",
+      "short_name": "업무일지",
+      "url": "./?tab=journal",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}
