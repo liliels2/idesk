@@ -7,6 +7,7 @@
     return {
       siteName:"estdesk",
       quickLinks:{ intra:"", attend:"", chat:"https://chat.google.com", music:"https://music.youtube.com" },
+      google:{ clientId:"", autoConnect:false },
       todos:[
         {id:uid(), text:"이 대시보드 링크 설정 채워넣기", done:false},
         {id:uid(), text:"오늘 할 일 추가해보기", done:false}
@@ -132,6 +133,7 @@
     document.getElementById("setAttend").value = state.quickLinks.attend || "";
     document.getElementById("setChat").value = state.quickLinks.chat || "";
     document.getElementById("setMusic").value = state.quickLinks.music || "";
+    document.getElementById("setGoogleId").value = (state.google && state.google.clientId) || "";
     document.getElementById("settingsModal").classList.add("show");
   }
   document.getElementById("btnSettings").addEventListener("click", openSettings);
@@ -144,8 +146,17 @@
     state.quickLinks.attend = document.getElementById("setAttend").value.trim();
     state.quickLinks.chat = document.getElementById("setChat").value.trim();
     state.quickLinks.music = document.getElementById("setMusic").value.trim();
+    if(!state.google) state.google = { clientId:"", autoConnect:false };
+    var newCid = document.getElementById("setGoogleId").value.trim();
+    if(newCid !== state.google.clientId){
+      state.google.clientId = newCid;
+      state.google.autoConnect = false;
+      GCAL.token = null; GCAL.tokenClient = null; GCAL.events = {};
+    }
     save();
     renderBrand();
+    renderGcalBtn();
+    renderCalendar();
     document.getElementById("settingsModal").classList.remove("show");
   });
 
@@ -204,79 +215,268 @@
     });
   });
 
+  /* ---------- Google Calendar (read-only overlay) ---------- */
+  var GCAL = { token:null, tokenClient:null, events:{}, busy:false };
+  var GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
+
+  function gcalClientId(){ return ((state.google && state.google.clientId) || "").trim(); }
+
+  function renderGcalBtn(){
+    var btn = document.getElementById("gcalBtn");
+    if(!btn) return;
+    if(GCAL.token){
+      btn.textContent = "Google 연결됨 · 해제";
+      btn.classList.add("on");
+    } else {
+      btn.textContent = gcalClientId() ? "Google 캘린더 연결" : "Google 캘린더 설정";
+      btn.classList.remove("on");
+    }
+  }
+
+  function loadGis(cb){
+    if(window.google && window.google.accounts && window.google.accounts.oauth2){ cb(); return; }
+    var existing = document.getElementById("gisScript");
+    if(existing){ existing.addEventListener("load", cb); return; }
+    var s = document.createElement("script");
+    s.id = "gisScript";
+    s.src = "https://accounts.google.com/gsi/client";
+    s.async = true; s.defer = true;
+    s.onload = cb;
+    s.onerror = function(){ GCAL.busy = false; toast("Google 스크립트를 불러오지 못했어요"); };
+    document.head.appendChild(s);
+  }
+
+  function gcalInit(cb){
+    loadGis(function(){
+      if(GCAL.tokenClient){ cb(); return; }
+      try{
+        GCAL.tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: gcalClientId(),
+          scope: GCAL_SCOPE,
+          callback: function(resp){
+            GCAL.busy = false;
+            if(resp && resp.access_token){
+              GCAL.token = resp.access_token;
+              if(state.google && !state.google.autoConnect){ state.google.autoConnect = true; save(); }
+              renderGcalBtn();
+              fetchGcalMonth();
+            } else {
+              renderGcalBtn();
+            }
+          },
+          error_callback: function(){ GCAL.busy = false; renderGcalBtn(); }
+        });
+      }catch(e){
+        GCAL.busy = false;
+        toast("Google 클라이언트 ID를 확인해주세요");
+        return;
+      }
+      cb();
+    });
+  }
+
+  function gcalConnect(silent){
+    if(GCAL.busy) return;
+    if(!gcalClientId()){ openSettings(); return; }
+    GCAL.busy = true;
+    gcalInit(function(){
+      try{
+        GCAL.tokenClient.requestAccessToken(silent ? { prompt: "" } : {});
+      }catch(e){ GCAL.busy = false; toast("Google 연결에 실패했어요"); }
+    });
+  }
+
+  function gcalDisconnect(){
+    if(GCAL.token && window.google && google.accounts && google.accounts.oauth2){
+      try{ google.accounts.oauth2.revoke(GCAL.token); }catch(e){}
+    }
+    GCAL.token = null; GCAL.events = {};
+    if(state.google){ state.google.autoConnect = false; save(); }
+    renderGcalBtn(); renderCalendar(); renderHome();
+    toast("Google 캘린더 연결을 해제했어요");
+  }
+
+  function fetchGcalMonth(){
+    if(!GCAL.token) return;
+    var y = calCursor.getFullYear(), m = calCursor.getMonth();
+    var timeMin = new Date(y, m-1, 1).toISOString();
+    var timeMax = new Date(y, m+2, 1).toISOString();
+    var url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+      + "?timeMin=" + encodeURIComponent(timeMin)
+      + "&timeMax=" + encodeURIComponent(timeMax)
+      + "&singleEvents=true&orderBy=startTime&maxResults=250";
+    fetch(url, { headers: { Authorization: "Bearer " + GCAL.token } })
+      .then(function(r){
+        if(r.status === 401 || r.status === 403){
+          GCAL.token = null; renderGcalBtn();
+          throw new Error("auth");
+        }
+        if(!r.ok) throw new Error("http " + r.status);
+        return r.json();
+      })
+      .then(function(data){
+        GCAL.events = {};
+        (data.items || []).forEach(function(it){
+          var raw = it.start && (it.start.date || it.start.dateTime);
+          if(!raw) return;
+          var allDay = !!(it.start && it.start.date);
+          var ds = allDay ? raw.slice(0,10) : localDateStr(new Date(raw));
+          var time = allDay ? "" : hhmm(new Date(raw));
+          if(!GCAL.events[ds]) GCAL.events[ds] = [];
+          GCAL.events[ds].push({ title: it.summary || "(제목 없음)", time: time });
+        });
+        renderCalendar(); renderHome();
+      })
+      .catch(function(e){
+        if(String(e.message) !== "auth") toast("Google 일정을 불러오지 못했어요");
+      });
+  }
+
+  document.getElementById("gcalBtn").addEventListener("click", function(){
+    if(GCAL.token) gcalDisconnect(); else gcalConnect(false);
+  });
+
   /* ---------- Calendar ---------- */
   var calCursor = new Date();
   var selectedDate = todayStr();
+  var DOW_KO = ["일","월","화","수","목","금","토"];
+  var CELL_EV_LIMIT = 3;
+
+  function localDateStr(dt){ return dt.getFullYear()+"-"+pad(dt.getMonth()+1)+"-"+pad(dt.getDate()); }
+  function hhmm(dt){ return pad(dt.getHours())+":"+pad(dt.getMinutes()); }
+  function localEvents(ds){ return state.calendarEvents[ds] || []; }
+  function googleEvents(ds){ return (GCAL.events && GCAL.events[ds]) || []; }
+  function gcalLabel(ev){ return (ev.time ? ev.time + " " : "") + ev.title; }
+
+  function renderDows(){
+    var box = document.getElementById("calDows");
+    box.innerHTML = "";
+    DOW_KO.forEach(function(d){
+      var el = document.createElement("div");
+      el.className = "cal-dow";
+      el.textContent = d;
+      box.appendChild(el);
+    });
+  }
+
   function renderCalendar(){
     var y = calCursor.getFullYear(), m = calCursor.getMonth();
     document.getElementById("calLabel").textContent = y + "년 " + (m+1) + "월";
     var grid = document.getElementById("calGrid");
     grid.innerHTML = "";
-    ["일","월","화","수","목","금","토"].forEach(function(d){
-      var el = document.createElement("div");
-      el.className = "cal-dow"; el.textContent = d;
-      grid.appendChild(el);
-    });
-    var firstDow = new Date(y,m,1).getDay();
-    var daysInMonth = new Date(y,m+1,0).getDate();
-    for(var i=0;i<firstDow;i++){
-      var blank = document.createElement("div");
-      blank.className = "cal-cell blank";
-      grid.appendChild(blank);
-    }
-    for(var d=1; d<=daysInMonth; d++){
-      var dateStr = y+"-"+pad(m+1)+"-"+pad(d);
-      var cell = document.createElement("button");
-      cell.className = "cal-cell";
-      if(dateStr === todayStr()) cell.classList.add("today");
-      if(dateStr === selectedDate) cell.classList.add("selected");
-      cell.textContent = d;
-      if(state.calendarEvents[dateStr] && state.calendarEvents[dateStr].length){
-        var dot = document.createElement("span");
-        dot.className = "dot";
-        cell.appendChild(dot);
+
+    var firstDow = new Date(y, m, 1).getDay();
+    var daysInMonth = new Date(y, m+1, 0).getDate();
+    var prevDays = new Date(y, m, 0).getDate();
+    var total = Math.ceil((firstDow + daysInMonth) / 7) * 7;
+    var today = todayStr();
+
+    for(var i=0; i<total; i++){
+      var dayNum, cellM = m, out = false;
+      if(i < firstDow){
+        dayNum = prevDays - firstDow + 1 + i; cellM = m-1; out = true;
+      } else if(i >= firstDow + daysInMonth){
+        dayNum = i - firstDow - daysInMonth + 1; cellM = m+1; out = true;
+      } else {
+        dayNum = i - firstDow + 1;
       }
-      cell.dataset.date = dateStr;
+      var ds = localDateStr(new Date(y, cellM, dayNum));
+
+      var cell = document.createElement("button");
+      cell.className = "cal-cell"
+        + (out ? " out" : "")
+        + (ds === today ? " today" : "")
+        + (ds === selectedDate ? " selected" : "");
+      cell.dataset.date = ds;
+
+      var num = document.createElement("span");
+      num.className = "dnum";
+      num.textContent = dayNum;
+      cell.appendChild(num);
+
+      var evs = localEvents(ds).map(function(t){ return { t:t, g:false }; })
+        .concat(googleEvents(ds).map(function(e){ return { t:gcalLabel(e), g:true }; }));
+
+      if(evs.length){
+        var box = document.createElement("span");
+        box.className = "cal-evs";
+        evs.slice(0, CELL_EV_LIMIT).forEach(function(e){
+          var row = document.createElement("span");
+          row.className = "cal-ev" + (e.g ? " g" : "");
+          row.innerHTML = '<span class="bullet"></span><span class="t"></span>';
+          row.querySelector(".t").textContent = e.t;
+          row.title = e.t;
+          box.appendChild(row);
+        });
+        cell.appendChild(box);
+        if(evs.length > CELL_EV_LIMIT){
+          var more = document.createElement("span");
+          more.className = "cal-more";
+          more.textContent = "+" + (evs.length - CELL_EV_LIMIT);
+          cell.appendChild(more);
+        }
+      }
       grid.appendChild(cell);
     }
     renderDayEvents();
   }
+
+  function goMonth(y, m){
+    calCursor = new Date(y, m, 1);
+    renderCalendar();
+    fetchGcalMonth();
+  }
+
   document.getElementById("calGrid").addEventListener("click", function(e){
     var cell = e.target.closest(".cal-cell");
     if(!cell || !cell.dataset.date) return;
     selectedDate = cell.dataset.date;
+    if(cell.classList.contains("out")){
+      var p = selectedDate.split("-");
+      goMonth(parseInt(p[0],10), parseInt(p[1],10)-1);
+      return;
+    }
     renderCalendar();
   });
   document.getElementById("calPrev").addEventListener("click", function(){
-    calCursor.setMonth(calCursor.getMonth()-1); renderCalendar();
+    goMonth(calCursor.getFullYear(), calCursor.getMonth()-1);
   });
   document.getElementById("calNext").addEventListener("click", function(){
-    calCursor.setMonth(calCursor.getMonth()+1); renderCalendar();
+    goMonth(calCursor.getFullYear(), calCursor.getMonth()+1);
   });
   document.getElementById("calToday").addEventListener("click", function(){
-    calCursor = new Date();
+    var n = new Date();
     selectedDate = todayStr();
-    renderCalendar();
+    goMonth(n.getFullYear(), n.getMonth());
   });
+
   function renderDayEvents(){
     var box = document.getElementById("dayEvents");
-    var evs = state.calendarEvents[selectedDate] || [];
+    var evs = localEvents(selectedDate);
+    var gevs = googleEvents(selectedDate);
     var html = '<div class="dlabel">'+selectedDate+' 일정</div>';
-    if(evs.length===0){ html += '<div class="empty-msg">등록된 일정이 없어요</div>'; }
-    else{
-      evs.forEach(function(ev, idx){
-        html += '<div class="ev-row"><span class="dot2"></span><span></span><button class="del-x" data-idx="'+idx+'">✕</button></div>';
-      });
+    if(evs.length===0 && gevs.length===0){
+      html += '<div class="empty-msg">등록된 일정이 없어요</div>';
     }
+    evs.forEach(function(ev, idx){
+      html += '<div class="ev-row"><span class="dot2"></span><span class="et"></span><button class="del-x" data-idx="'+idx+'">✕</button></div>';
+    });
+    gevs.forEach(function(){
+      html += '<div class="ev-row g"><span class="dot2"></span><span class="et"></span><span class="gtag">Google</span></div>';
+    });
     html += '<div class="ev-add"><input type="text" id="evInput" placeholder="일정 추가"><button class="btn-round" id="evAddBtn">추가</button></div>';
     box.innerHTML = html;
-    var rows = box.querySelectorAll(".ev-row span:nth-child(2)");
-    evs.forEach(function(ev, idx){ rows[idx].textContent = ev; });
+
+    var texts = box.querySelectorAll(".ev-row .et");
+    evs.forEach(function(ev, i){ texts[i].textContent = ev; });
+    gevs.forEach(function(ev, i){ texts[evs.length + i].textContent = gcalLabel(ev); });
+
     box.querySelectorAll(".ev-row .del-x").forEach(function(btn){
       btn.addEventListener("click", function(){
         var idx = parseInt(btn.dataset.idx,10);
         state.calendarEvents[selectedDate].splice(idx,1);
-        save(); renderCalendar();
+        if(state.calendarEvents[selectedDate].length === 0) delete state.calendarEvents[selectedDate];
+        save(); renderCalendar(); renderHome();
       });
     });
     var addBtn = document.getElementById("evAddBtn");
@@ -286,7 +486,7 @@
       if(!v) return;
       if(!state.calendarEvents[selectedDate]) state.calendarEvents[selectedDate]=[];
       state.calendarEvents[selectedDate].push(v);
-      save(); renderCalendar();
+      save(); renderCalendar(); renderHome();
     }
     addBtn.addEventListener("click", doAdd);
     addInput.addEventListener("keydown", function(e){ if(e.key==="Enter") doAdd(); });
@@ -305,10 +505,17 @@
       listEl.appendChild(row);
     });
     var evBox = document.getElementById("homeEvents");
+    var merged = {};
+    function push(d, label){ (merged[d] = merged[d] || []).push(label); }
+    Object.keys(state.calendarEvents).forEach(function(d){
+      (state.calendarEvents[d] || []).forEach(function(ev){ push(d, ev); });
+    });
+    Object.keys(GCAL.events || {}).forEach(function(d){
+      GCAL.events[d].forEach(function(ev){ push(d, gcalLabel(ev)); });
+    });
     var upcoming = [];
-    var dates = Object.keys(state.calendarEvents).filter(function(d){ return d >= todayStr(); }).sort();
-    dates.slice(0,4).forEach(function(d){
-      state.calendarEvents[d].forEach(function(ev){ upcoming.push(d+" · "+ev); });
+    Object.keys(merged).filter(function(d){ return d >= todayStr(); }).sort().slice(0,4).forEach(function(d){
+      merged[d].forEach(function(ev){ upcoming.push(d+" · "+ev); });
     });
     evBox.innerHTML = upcoming.length ? "" : '<div class="empty-msg">다가오는 일정이 없어요</div>';
     upcoming.slice(0,5).forEach(function(u){
@@ -704,7 +911,10 @@
   /* ---------- Init render ---------- */
   renderBrand();
   renderTodo();
+  renderDows();
   renderCalendar();
+  renderGcalBtn();
+  if(gcalClientId() && state.google && state.google.autoConnect){ gcalConnect(true); }
   renderJournal();
   renderNotes();
   renderBookmarks();
