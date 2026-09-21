@@ -92,6 +92,7 @@
           <div class="cal-legend">
             <span class="lg lg-local">내 일정</span>
             <span class="lg lg-google">Google</span>
+            <span class="lg lg-holiday">공휴일</span>
           </div>
           <button class="btn-ghost gcal-btn" id="gcalBtn">Google 캘린더 연결</button>
         </div>
@@ -196,6 +197,9 @@
     <label>Google 캘린더 클라이언트 ID</label>
     <input type="text" id="setGoogleId" placeholder="000000-xxxx.apps.googleusercontent.com">
     <div class="modal-hint">Google Cloud Console에서 만든 OAuth 웹 클라이언트 ID입니다. 승인된 JavaScript 원본에 이 사이트 주소를 넣어두세요.</div>
+    <label>숨길 일정 (쉼표로 구분)</label>
+    <input type="text" id="setHideWords" placeholder="사무실, 재택">
+    <div class="modal-hint">제목에 이 단어가 들어간 Google 일정은 표시하지 않습니다. 근무 위치 일정은 단어와 상관없이 항상 숨깁니다.</div>
     <div class="modal-actions">
       <button class="btn-ghost" id="settingsCancel">닫기</button>
       <button class="btn-round" id="settingsSave">저장</button>

@@ -8,6 +8,7 @@
       siteName:"estdesk",
       quickLinks:{ intra:"", attend:"", chat:"https://chat.google.com", music:"https://music.youtube.com" },
       google:{ clientId:"", autoConnect:false },
+      hiddenEventWords:["사무실"],
       todos:[
         {id:uid(), text:"이 대시보드 링크 설정 채워넣기", done:false},
         {id:uid(), text:"오늘 할 일 추가해보기", done:false}
@@ -122,7 +123,13 @@
     document.getElementById("clockLine").textContent = timeStr;
     var tc = document.getElementById("tabletClock");
     if(tc) tc.textContent = timeStr;
+
+    /* keeps "다가오는 일정" from holding on to events that just passed */
+    renderHome();
+    var t = todayStr();
+    if(t !== lastSeenDay){ lastSeenDay = t; renderCalendar(); }
   }
+  var lastSeenDay = todayStr();
 
   /* ---------- Quick launch ---------- */
   function openOrSettings(url){
@@ -141,6 +148,7 @@
     document.getElementById("setChat").value = state.quickLinks.chat || "";
     document.getElementById("setMusic").value = state.quickLinks.music || "";
     document.getElementById("setGoogleId").value = (state.google && state.google.clientId) || "";
+    document.getElementById("setHideWords").value = (state.hiddenEventWords || []).join(", ");
     document.getElementById("settingsModal").classList.add("show");
   }
   document.getElementById("btnSettings").addEventListener("click", openSettings);
@@ -153,6 +161,8 @@
     state.quickLinks.attend = document.getElementById("setAttend").value.trim();
     state.quickLinks.chat = document.getElementById("setChat").value.trim();
     state.quickLinks.music = document.getElementById("setMusic").value.trim();
+    state.hiddenEventWords = document.getElementById("setHideWords").value
+      .split(",").map(function(w){ return w.trim(); }).filter(Boolean);
     if(!state.google) state.google = { clientId:"", autoConnect:false };
     var newCid = document.getElementById("setGoogleId").value.trim();
     if(newCid !== state.google.clientId){
@@ -164,6 +174,8 @@
     renderBrand();
     renderGcalBtn();
     renderCalendar();
+    /* the hide list is applied while collecting, so re-pull to make it bite */
+    if(GCAL.token) fetchGcalMonth();
     document.getElementById("settingsModal").classList.remove("show");
   });
 
@@ -223,8 +235,11 @@
   });
 
   /* ---------- Google Calendar (read-only overlay) ---------- */
-  var GCAL = { token:null, tokenClient:null, events:{}, busy:false };
+  var GCAL = { token:null, tokenAt:0, tokenClient:null, events:{}, busy:false, retried:false, lastFetch:0 };
   var GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
+  var GCAL_HOLIDAY_ID = "ko.south_korea#holiday@group.v.calendar.google.com";
+  var GCAL_TOKEN_TTL = 50 * 60 * 1000;   // renew before the 1h expiry
+  var GCAL_POLL_MS = 5 * 60 * 1000;
 
   function gcalClientId(){ return ((state.google && state.google.clientId) || "").trim(); }
 
@@ -264,6 +279,7 @@
             GCAL.busy = false;
             if(resp && resp.access_token){
               GCAL.token = resp.access_token;
+              GCAL.tokenAt = Date.now();
               if(state.google && !state.google.autoConnect){ state.google.autoConnect = true; save(); }
               renderGcalBtn();
               fetchGcalMonth();
@@ -303,41 +319,106 @@
     toast("Google 캘린더 연결을 해제했어요");
   }
 
+  function isHiddenEvent(title){
+    var words = state.hiddenEventWords || [];
+    var t = String(title || "").toLowerCase();
+    for(var i=0;i<words.length;i++){
+      var w = String(words[i]).trim().toLowerCase();
+      if(w && t.indexOf(w) !== -1) return true;
+    }
+    return false;
+  }
+
+  function gcalFetchCalendar(id, timeMin, timeMax){
+    var url = "https://www.googleapis.com/calendar/v3/calendars/"
+      + encodeURIComponent(id) + "/events"
+      + "?timeMin=" + encodeURIComponent(timeMin)
+      + "&timeMax=" + encodeURIComponent(timeMax)
+      + "&singleEvents=true&orderBy=startTime&maxResults=250";
+    return fetch(url, { headers: { Authorization: "Bearer " + GCAL.token } })
+      .then(function(r){
+        if(r.status === 401){ var err = new Error("auth"); err.auth = true; throw err; }
+        if(!r.ok) throw new Error("http " + r.status);
+        return r.json();
+      });
+  }
+
+  function collectGcal(map, items, isHoliday){
+    (items || []).forEach(function(it){
+      /* "근무 위치" entries are noise on a dashboard, whatever they're labelled */
+      if(!isHoliday && it.eventType === "workingLocation") return;
+      var raw = it.start && (it.start.date || it.start.dateTime);
+      if(!raw) return;
+      var title = it.summary || "(제목 없음)";
+      if(!isHoliday && isHiddenEvent(title)) return;
+      var allDay = !!(it.start && it.start.date);
+      var dt = allDay ? new Date(raw + "T00:00:00") : new Date(raw);
+      var ds = allDay ? raw.slice(0,10) : localDateStr(dt);
+      (map[ds] = map[ds] || []).push({
+        title: title,
+        time: allDay ? "" : hhmm(dt),
+        start: dt.getTime(),
+        allDay: allDay,
+        holiday: !!isHoliday
+      });
+    });
+  }
+
   function fetchGcalMonth(){
     if(!GCAL.token) return;
     var y = calCursor.getFullYear(), m = calCursor.getMonth();
     var timeMin = new Date(y, m-1, 1).toISOString();
     var timeMax = new Date(y, m+2, 1).toISOString();
-    var url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-      + "?timeMin=" + encodeURIComponent(timeMin)
-      + "&timeMax=" + encodeURIComponent(timeMax)
-      + "&singleEvents=true&orderBy=startTime&maxResults=250";
-    fetch(url, { headers: { Authorization: "Bearer " + GCAL.token } })
-      .then(function(r){
-        if(r.status === 401 || r.status === 403){
-          GCAL.token = null; renderGcalBtn();
-          throw new Error("auth");
-        }
-        if(!r.ok) throw new Error("http " + r.status);
-        return r.json();
+
+    Promise.all([
+      gcalFetchCalendar("primary", timeMin, timeMax),
+      /* Google's Korean holiday calendar; a failure here must not lose the real events */
+      gcalFetchCalendar(GCAL_HOLIDAY_ID, timeMin, timeMax).catch(function(e){
+        if(e && e.auth) throw e;
+        return { items: [] };
       })
-      .then(function(data){
-        GCAL.events = {};
-        (data.items || []).forEach(function(it){
-          var raw = it.start && (it.start.date || it.start.dateTime);
-          if(!raw) return;
-          var allDay = !!(it.start && it.start.date);
-          var ds = allDay ? raw.slice(0,10) : localDateStr(new Date(raw));
-          var time = allDay ? "" : hhmm(new Date(raw));
-          if(!GCAL.events[ds]) GCAL.events[ds] = [];
-          GCAL.events[ds].push({ title: it.summary || "(제목 없음)", time: time });
+    ]).then(function(res){
+      var map = {};
+      collectGcal(map, res[0].items, false);
+      collectGcal(map, res[1].items, true);
+      Object.keys(map).forEach(function(d){
+        map[d].sort(function(a,b){
+          if(a.holiday !== b.holiday) return a.holiday ? -1 : 1;
+          return a.start - b.start;
         });
-        renderCalendar(); renderHome();
-      })
-      .catch(function(e){
-        if(String(e.message) !== "auth") toast("Google 일정을 불러오지 못했어요");
       });
+      GCAL.events = map;
+      GCAL.lastFetch = Date.now();
+      GCAL.retried = false;
+      renderCalendar(); renderHome();
+    }).catch(function(e){
+      if(e && e.auth){
+        GCAL.token = null;
+        renderGcalBtn();
+        if(!GCAL.retried && gcalActive()){ GCAL.retried = true; gcalConnect(true); }
+        return;
+      }
+      toast("Google 일정을 불러오지 못했어요");
+    });
   }
+
+  function gcalActive(){
+    return !!gcalClientId() && !!(state.google && state.google.autoConnect);
+  }
+
+  /* Keeps the overlay current without the user touching anything: poll while
+     visible, refetch on tab focus, and renew the token before it lapses. */
+  function refreshGcal(){
+    if(!gcalActive() || document.hidden) return;
+    if(GCAL.token && (Date.now() - GCAL.tokenAt) < GCAL_TOKEN_TTL) fetchGcalMonth();
+    else gcalConnect(true);
+  }
+
+  setInterval(refreshGcal, GCAL_POLL_MS);
+  document.addEventListener("visibilitychange", function(){
+    if(!document.hidden && Date.now() - GCAL.lastFetch > 60000) refreshGcal();
+  });
+  window.addEventListener("online", refreshGcal);
 
   document.getElementById("gcalBtn").addEventListener("click", function(){
     if(GCAL.token) gcalDisconnect(); else gcalConnect(false);
@@ -387,13 +468,17 @@
       } else {
         dayNum = i - firstDow + 1;
       }
-      var ds = localDateStr(new Date(y, cellM, dayNum));
+      var ref = new Date(y, cellM, dayNum);
+      var ds = localDateStr(ref);
+      var gevs = googleEvents(ds);
+      var isHoliday = gevs.some(function(e){ return e.holiday; });
 
       var cell = document.createElement("button");
       cell.className = "cal-cell"
         + (out ? " out" : "")
         + (ds === today ? " today" : "")
-        + (ds === selectedDate ? " selected" : "");
+        + (ds === selectedDate ? " selected" : "")
+        + ((isHoliday || ref.getDay() === 0) ? " red" : "");
       cell.dataset.date = ds;
 
       var num = document.createElement("span");
@@ -401,15 +486,15 @@
       num.textContent = dayNum;
       cell.appendChild(num);
 
-      var evs = localEvents(ds).map(function(t){ return { t:t, g:false }; })
-        .concat(googleEvents(ds).map(function(e){ return { t:gcalLabel(e), g:true }; }));
+      var evs = gevs.map(function(e){ return { t:gcalLabel(e), g:true, h:e.holiday }; })
+        .concat(localEvents(ds).map(function(t){ return { t:t, g:false, h:false }; }));
 
       if(evs.length){
         var box = document.createElement("span");
         box.className = "cal-evs";
         evs.slice(0, CELL_EV_LIMIT).forEach(function(e){
           var row = document.createElement("span");
-          row.className = "cal-ev" + (e.g ? " g" : "");
+          row.className = "cal-ev" + (e.h ? " h" : (e.g ? " g" : ""));
           row.innerHTML = '<span class="bullet"></span><span class="t"></span>';
           row.querySelector(".t").textContent = e.t;
           row.title = e.t;
@@ -468,8 +553,9 @@
     evs.forEach(function(ev, idx){
       html += '<div class="ev-row"><span class="dot2"></span><span class="et"></span><button class="del-x" data-idx="'+idx+'">✕</button></div>';
     });
-    gevs.forEach(function(){
-      html += '<div class="ev-row g"><span class="dot2"></span><span class="et"></span><span class="gtag">Google</span></div>';
+    gevs.forEach(function(ev){
+      html += '<div class="ev-row '+(ev.holiday ? "h" : "g")+'"><span class="dot2"></span><span class="et"></span>'
+        + '<span class="gtag">'+(ev.holiday ? "공휴일" : "Google")+'</span></div>';
     });
     html += '<div class="ev-add"><input type="text" id="evInput" placeholder="일정 추가"><button class="btn-round" id="evAddBtn">추가</button></div>';
     box.innerHTML = html;
@@ -512,23 +598,30 @@
       listEl.appendChild(row);
     });
     var evBox = document.getElementById("homeEvents");
-    var merged = {};
-    function push(d, label){ (merged[d] = merged[d] || []).push(label); }
+    var now = Date.now();
+    var today = todayStr();
+    var items = [];
+    /* Local entries carry no time, so they stay listed for the whole day. */
     Object.keys(state.calendarEvents).forEach(function(d){
-      (state.calendarEvents[d] || []).forEach(function(ev){ push(d, ev); });
+      if(d < today) return;
+      (state.calendarEvents[d] || []).forEach(function(ev){
+        items.push({ d:d, label:ev, sort:new Date(d+"T00:00:00").getTime() });
+      });
     });
     Object.keys(GCAL.events || {}).forEach(function(d){
-      GCAL.events[d].forEach(function(ev){ push(d, gcalLabel(ev)); });
+      if(d < today) return;
+      GCAL.events[d].forEach(function(ev){
+        if(ev.holiday) return;                     /* holidays belong on the grid, not here */
+        if(!ev.allDay && ev.start < now) return;   /* already started */
+        items.push({ d:d, label:gcalLabel(ev), sort:ev.start });
+      });
     });
-    var upcoming = [];
-    Object.keys(merged).filter(function(d){ return d >= todayStr(); }).sort().slice(0,4).forEach(function(d){
-      merged[d].forEach(function(ev){ upcoming.push(d+" · "+ev); });
-    });
-    evBox.innerHTML = upcoming.length ? "" : '<div class="empty-msg">다가오는 일정이 없어요</div>';
-    upcoming.slice(0,5).forEach(function(u){
+    items.sort(function(a,b){ return a.sort - b.sort; });
+    evBox.innerHTML = items.length ? "" : '<div class="empty-msg">다가오는 일정이 없어요</div>';
+    items.slice(0,5).forEach(function(it){
       var row = document.createElement("div");
       row.style.fontSize = "13.5px"; row.style.padding="4px 0";
-      row.textContent = "• " + u;
+      row.textContent = "• " + it.d + " · " + it.label;
       evBox.appendChild(row);
     });
   }
