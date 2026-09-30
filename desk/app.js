@@ -731,32 +731,139 @@
   }
 
   /* ---------- Journal / book ---------- */
+  function mdEsc(s){
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  /* Split a table row on unescaped pipes, dropping the optional outer ones. */
+  function mdSplitRow(line){
+    var t = line.trim();
+    if(t.charAt(0) === "|") t = t.slice(1);
+    if(t.charAt(t.length-1) === "|") t = t.slice(0, -1);
+    var cells = [], cur = "";
+    for(var i=0; i<t.length; i++){
+      var c = t.charAt(i);
+      if(c === "\\" && t.charAt(i+1) === "|"){ cur += "|"; i++; continue; }
+      if(c === "|"){ cells.push(cur.trim()); cur = ""; continue; }
+      cur += c;
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+
+  /* the |---|:--:| line that turns the row above it into a header */
+  function mdIsDelimiter(line){
+    var t = (line || "").trim();
+    if(t.indexOf("-") === -1 || t.indexOf("|") === -1) return false;
+    return mdSplitRow(t).every(function(c){ return /^:?-+:?$/.test(c); });
+  }
+
+  function mdAligns(line){
+    return mdSplitRow(line).map(function(c){
+      var l = c.charAt(0) === ":", r = c.charAt(c.length-1) === ":";
+      if(l && r) return "center";
+      if(r) return "right";
+      if(l) return "left";
+      return "";
+    });
+  }
+
   function mdToHtml(md){
-    var esc = md.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    var lines = esc.split("\n");
-    var out = []; var inList = null;
-    function closeList(){ if(inList){ out.push("</"+inList+">"); inList=null; } }
-    function inlineFmt(s){
-      s = s.replace(/\*\*(.+?)\*\*/g,"<strong>$1</strong>");
-      s = s.replace(/\*(.+?)\*/g,"<em>$1</em>");
-      s = s.replace(/`(.+?)`/g,"<code>$1</code>");
-      s = s.replace(/\[(.+?)\]\((.+?)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+    var lines = String(md || "").replace(/\r\n?/g, "\n").split("\n");
+    var out = [], listType = null, i = 0;
+
+    function closeList(){ if(listType){ out.push("</"+listType+">"); listType = null; } }
+
+    function inlineFmt(raw){
+      var s = mdEsc(raw);
+      s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+      s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      s = s.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+      s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+      s = s.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, function(_, text, href){
+        if(/^\s*javascript:/i.test(href)) return text;   // imported files aren't trusted
+        return '<a href="' + href.replace(/"/g, "&quot;") + '" target="_blank" rel="noopener">' + text + '</a>';
+      });
       return s;
     }
-    lines.forEach(function(line){
-      var t = line.trim();
-      if(t===""){ closeList(); return; }
-      var h = t.match(/^(#{1,3})\s+(.*)/);
-      if(h){ closeList(); var lvl=h[1].length; out.push("<h"+lvl+">"+inlineFmt(h[2])+"</h"+lvl+">"); return; }
-      var ul = t.match(/^[-*]\s+(.*)/);
-      if(ul){ if(inList!=="ul"){ closeList(); out.push("<ul>"); inList="ul"; } out.push("<li>"+inlineFmt(ul[1])+"</li>"); return; }
-      var ol = t.match(/^\d+\.\s+(.*)/);
-      if(ol){ if(inList!=="ol"){ closeList(); out.push("<ol>"); inList="ol"; } out.push("<li>"+inlineFmt(ol[1])+"</li>"); return; }
-      var bq = t.match(/^>\s?(.*)/);
-      if(bq){ closeList(); out.push("<blockquote>"+inlineFmt(bq[1])+"</blockquote>"); return; }
+
+    function cell(tag, text, align){
+      return "<" + tag + (align ? ' style="text-align:' + align + '"' : "") + ">"
+        + inlineFmt(text) + "</" + tag + ">";
+    }
+
+    while(i < lines.length){
+      var line = lines[i], t = line.trim();
+
+      /* fenced code first: its contents must not be read as markdown */
+      var fence = t.match(/^(```|~~~)/);
+      if(fence){
+        closeList();
+        var mark = fence[1], buf = [];
+        i++;
+        while(i < lines.length && lines[i].trim().indexOf(mark) !== 0){ buf.push(lines[i]); i++; }
+        i++;
+        out.push("<pre><code>" + mdEsc(buf.join("\n")) + "</code></pre>");
+        continue;
+      }
+
+      /* table: a row of cells whose next line is the delimiter */
+      if(t.indexOf("|") !== -1 && mdIsDelimiter(lines[i+1])){
+        closeList();
+        var head = mdSplitRow(line), aligns = mdAligns(lines[i+1]);
+        i += 2;
+        var body = [];
+        while(i < lines.length && lines[i].trim() !== "" && lines[i].indexOf("|") !== -1){
+          body.push(mdSplitRow(lines[i]));
+          i++;
+        }
+        var html = ["<table><thead><tr>"];
+        head.forEach(function(c, n){ html.push(cell("th", c, aligns[n])); });
+        html.push("</tr></thead><tbody>");
+        body.forEach(function(row){
+          html.push("<tr>");
+          for(var n=0; n<head.length; n++) html.push(cell("td", row[n] || "", aligns[n]));
+          html.push("</tr>");
+        });
+        html.push("</tbody></table>");
+        /* wrapper scrolls instead of stretching the page */
+        out.push('<div class="md-table">' + html.join("") + "</div>");
+        continue;
+      }
+
+      if(t === ""){ closeList(); i++; continue; }
+
+      if(/^(-{3,}|\*{3,}|_{3,})$/.test(t)){ closeList(); out.push("<hr>"); i++; continue; }
+
+      var h = t.match(/^(#{1,6})\s+(.*)$/);
+      if(h){
+        closeList();
+        var lvl = h[1].length;
+        out.push("<h"+lvl+">" + inlineFmt(h[2]) + "</h"+lvl+">");
+        i++; continue;
+      }
+
+      var ul = t.match(/^[-*+]\s+(.*)$/);
+      if(ul){
+        if(listType !== "ul"){ closeList(); out.push("<ul>"); listType = "ul"; }
+        out.push("<li>" + inlineFmt(ul[1]) + "</li>");
+        i++; continue;
+      }
+
+      var ol = t.match(/^\d+[.)]\s+(.*)$/);
+      if(ol){
+        if(listType !== "ol"){ closeList(); out.push("<ol>"); listType = "ol"; }
+        out.push("<li>" + inlineFmt(ol[1]) + "</li>");
+        i++; continue;
+      }
+
+      var bq = t.match(/^>\s?(.*)$/);
+      if(bq){ closeList(); out.push("<blockquote>" + inlineFmt(bq[1]) + "</blockquote>"); i++; continue; }
+
       closeList();
-      out.push("<p>"+inlineFmt(t)+"</p>");
-    });
+      out.push("<p>" + inlineFmt(t) + "</p>");
+      i++;
+    }
     closeList();
     return out.join("\n");
   }
