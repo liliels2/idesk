@@ -1,6 +1,6 @@
 /* estdesk service worker
    Bump CACHE whenever the shell changes so old caches get dropped. */
-var CACHE = "estdesk-v2";
+var CACHE = "estdesk-v3";
 
 var SHELL = [
   "./",

@@ -7,7 +7,7 @@
     return {
       siteName:"estdesk",
       quickLinks:{ intra:"", attend:"", chat:"https://chat.google.com", music:"https://music.youtube.com" },
-      google:{ clientId:"", autoConnect:false },
+      google:{ clientId:"", autoConnect:false, proxyUrl:"", email:"" },
       hiddenEventWords:["사무실"],
       todos:[
         {id:uid(), text:"이 대시보드 링크 설정 채워넣기", done:false},
@@ -44,6 +44,9 @@
       var parsed = JSON.parse(raw);
       var def = defaultState();
       for(var k in def){ if(!(k in parsed)) parsed[k]=def[k]; }
+      /* the top-level merge won't reach inside an existing google object */
+      if(typeof parsed.google.proxyUrl !== "string") parsed.google.proxyUrl = "";
+      if(typeof parsed.google.email !== "string") parsed.google.email = "";
       return parsed;
     }catch(e){ return defaultState(); }
   }
@@ -149,6 +152,7 @@
     document.getElementById("setMusic").value = state.quickLinks.music || "";
     document.getElementById("setGoogleId").value = (state.google && state.google.clientId) || "";
     document.getElementById("setHideWords").value = (state.hiddenEventWords || []).join(", ");
+    document.getElementById("setProxyUrl").value = (state.google && state.google.proxyUrl) || "";
     document.getElementById("settingsModal").classList.add("show");
   }
   document.getElementById("btnSettings").addEventListener("click", openSettings);
@@ -163,19 +167,21 @@
     state.quickLinks.music = document.getElementById("setMusic").value.trim();
     state.hiddenEventWords = document.getElementById("setHideWords").value
       .split(",").map(function(w){ return w.trim(); }).filter(Boolean);
-    if(!state.google) state.google = { clientId:"", autoConnect:false };
+    if(!state.google) state.google = { clientId:"", autoConnect:false, proxyUrl:"", email:"" };
+    state.google.proxyUrl = document.getElementById("setProxyUrl").value.trim();
     var newCid = document.getElementById("setGoogleId").value.trim();
     if(newCid !== state.google.clientId){
       state.google.clientId = newCid;
       state.google.autoConnect = false;
-      GCAL.token = null; GCAL.tokenClient = null; GCAL.events = {};
+      state.google.email = "";
+      GCAL.token = null; GCAL.tokenClient = null; GCAL.clientKey = ""; GCAL.events = {};
     }
     save();
     renderBrand();
     renderGcalBtn();
     renderCalendar();
     /* the hide list is applied while collecting, so re-pull to make it bite */
-    if(GCAL.token) fetchGcalMonth();
+    loadCalendarSource();
     document.getElementById("settingsModal").classList.remove("show");
   });
 
@@ -234,63 +240,99 @@
     });
   });
 
-  /* ---------- Google Calendar (read-only overlay) ---------- */
-  var GCAL = { token:null, tokenAt:0, tokenClient:null, events:{}, busy:false, retried:false, lastFetch:0 };
+  /* ---------- Google Calendar (read-only overlay) ----------
+     Two possible sources, both read-only:
+
+     1. Apps Script proxy — a URL you deploy from your own Google account.
+        No OAuth in the browser, no token to expire, so it can be polled on a
+        timer and needs no clicks at all. Used whenever a URL is set.
+
+     2. OAuth token client — Google's requestAccessToken() opens a popup, and
+        browsers block popups that no click triggered. So it is only ever
+        called from the connect button (plus one optional silent try per page
+        load). Calling it from timers is what used to stack re-auth windows.
+  */
+  var GCAL = {
+    token:null, tokenAt:0, tokenClient:null, clientKey:"",
+    events:{}, busy:false, busyTimer:null, lastFetch:0,
+    expired:false, triedOnLoad:false, warned:false
+  };
   var GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
   var GCAL_HOLIDAY_ID = "ko.south_korea#holiday@group.v.calendar.google.com";
-  var GCAL_TOKEN_TTL = 50 * 60 * 1000;   // renew before the 1h expiry
+  var GCAL_TOKEN_TTL = 50 * 60 * 1000;   // treat as stale before the 1h expiry
   var GCAL_POLL_MS = 5 * 60 * 1000;
 
   function gcalClientId(){ return ((state.google && state.google.clientId) || "").trim(); }
+  function gcalProxyUrl(){ return ((state.google && state.google.proxyUrl) || "").trim(); }
+  function gcalHint(){ return ((state.google && state.google.email) || ""); }
+  function gcalActive(){ return !!gcalClientId() && !!(state.google && state.google.autoConnect); }
 
   function renderGcalBtn(){
     var btn = document.getElementById("gcalBtn");
     if(!btn) return;
-    if(GCAL.token){
+    btn.classList.remove("on","warn");
+    if(gcalProxyUrl()){
+      btn.textContent = "자동 동기화 켜짐";
+      btn.classList.add("on");
+    } else if(GCAL.token){
       btn.textContent = "Google 연결됨 · 해제";
       btn.classList.add("on");
+    } else if(GCAL.expired){
+      btn.textContent = "세션 만료 · 다시 연결";
+      btn.classList.add("warn");
     } else {
       btn.textContent = gcalClientId() ? "Google 캘린더 연결" : "Google 캘린더 설정";
-      btn.classList.remove("on");
     }
+  }
+
+  function clearBusy(){
+    GCAL.busy = false;
+    if(GCAL.busyTimer){ clearTimeout(GCAL.busyTimer); GCAL.busyTimer = null; }
   }
 
   function loadGis(cb){
     if(window.google && window.google.accounts && window.google.accounts.oauth2){ cb(); return; }
     var existing = document.getElementById("gisScript");
-    if(existing){ existing.addEventListener("load", cb); return; }
+    if(existing){ existing.addEventListener("load", cb, { once:true }); return; }
     var s = document.createElement("script");
     s.id = "gisScript";
     s.src = "https://accounts.google.com/gsi/client";
     s.async = true; s.defer = true;
-    s.onload = cb;
-    s.onerror = function(){ GCAL.busy = false; toast("Google 스크립트를 불러오지 못했어요"); };
+    s.addEventListener("load", cb, { once:true });
+    s.onerror = function(){ clearBusy(); toast("Google 스크립트를 불러오지 못했어요"); };
     document.head.appendChild(s);
   }
 
   function gcalInit(cb){
     loadGis(function(){
-      if(GCAL.tokenClient){ cb(); return; }
+      /* rebuild once we learn the account, so the hint can skip the chooser */
+      var key = gcalClientId() + "|" + gcalHint();
+      if(GCAL.tokenClient && GCAL.clientKey === key){ cb(); return; }
       try{
-        GCAL.tokenClient = google.accounts.oauth2.initTokenClient({
+        var cfg = {
           client_id: gcalClientId(),
           scope: GCAL_SCOPE,
           callback: function(resp){
-            GCAL.busy = false;
+            clearBusy();
             if(resp && resp.access_token){
               GCAL.token = resp.access_token;
               GCAL.tokenAt = Date.now();
+              GCAL.expired = false;
               if(state.google && !state.google.autoConnect){ state.google.autoConnect = true; save(); }
               renderGcalBtn();
               fetchGcalMonth();
             } else {
+              GCAL.expired = true;
               renderGcalBtn();
             }
           },
-          error_callback: function(){ GCAL.busy = false; renderGcalBtn(); }
-        });
+          error_callback: function(){ clearBusy(); GCAL.expired = true; renderGcalBtn(); }
+        };
+        if(gcalHint()) cfg.hint = gcalHint();
+        GCAL.tokenClient = google.accounts.oauth2.initTokenClient(cfg);
+        GCAL.clientKey = key;
       }catch(e){
-        GCAL.busy = false;
+        clearBusy();
         toast("Google 클라이언트 ID를 확인해주세요");
         return;
       }
@@ -298,14 +340,19 @@
     });
   }
 
-  function gcalConnect(silent){
+  /* Only ever reached from a click, or once per page load. */
+  function gcalConnect(){
     if(GCAL.busy) return;
     if(!gcalClientId()){ openSettings(); return; }
     GCAL.busy = true;
+    /* a dismissed or blocked popup may never call back — don't wedge */
+    GCAL.busyTimer = setTimeout(function(){ clearBusy(); renderGcalBtn(); }, 60000);
     gcalInit(function(){
       try{
-        GCAL.tokenClient.requestAccessToken(silent ? { prompt: "" } : {});
-      }catch(e){ GCAL.busy = false; toast("Google 연결에 실패했어요"); }
+        /* prompt:"" once consent exists, so no consent screen and, with the
+           hint set, no account chooser either */
+        GCAL.tokenClient.requestAccessToken(gcalActive() ? { prompt: "" } : {});
+      }catch(e){ clearBusy(); toast("Google 연결에 실패했어요"); }
     });
   }
 
@@ -313,7 +360,7 @@
     if(GCAL.token && window.google && google.accounts && google.accounts.oauth2){
       try{ google.accounts.oauth2.revoke(GCAL.token); }catch(e){}
     }
-    GCAL.token = null; GCAL.events = {};
+    GCAL.token = null; GCAL.events = {}; GCAL.expired = false;
     if(state.google){ state.google.autoConnect = false; save(); }
     renderGcalBtn(); renderCalendar(); renderHome();
     toast("Google 캘린더 연결을 해제했어요");
@@ -364,54 +411,110 @@
     });
   }
 
+  function monthRange(){
+    var y = calCursor.getFullYear(), m = calCursor.getMonth();
+    return [ new Date(y, m-1, 1).toISOString(), new Date(y, m+2, 1).toISOString() ];
+  }
+
+  function applyEventMap(map){
+    Object.keys(map).forEach(function(d){
+      map[d].sort(function(a,b){
+        if(a.holiday !== b.holiday) return a.holiday ? -1 : 1;
+        return a.start - b.start;
+      });
+    });
+    GCAL.events = map;
+    GCAL.lastFetch = Date.now();
+    GCAL.warned = false;
+    renderCalendar(); renderHome();
+  }
+
+  /* one toast per outage, not one per poll */
+  function gcalWarn(msg){
+    if(GCAL.warned) return;
+    GCAL.warned = true;
+    toast(msg);
+  }
+
   function fetchGcalMonth(){
     if(!GCAL.token) return;
-    var y = calCursor.getFullYear(), m = calCursor.getMonth();
-    var timeMin = new Date(y, m-1, 1).toISOString();
-    var timeMax = new Date(y, m+2, 1).toISOString();
-
+    var r = monthRange();
     Promise.all([
-      gcalFetchCalendar("primary", timeMin, timeMax),
-      /* Google's Korean holiday calendar; a failure here must not lose the real events */
-      gcalFetchCalendar(GCAL_HOLIDAY_ID, timeMin, timeMax).catch(function(e){
+      gcalFetchCalendar("primary", r[0], r[1]),
+      /* Korean holidays; a failure here must not lose the real events */
+      gcalFetchCalendar(GCAL_HOLIDAY_ID, r[0], r[1]).catch(function(e){
         if(e && e.auth) throw e;
         return { items: [] };
       })
     ]).then(function(res){
+      /* the primary calendar's summary is the account address — use it as the
+         login hint so later reconnects skip the account chooser */
+      var who = res[0].summary || "";
+      if(who.indexOf("@") > 0 && state.google && state.google.email !== who){
+        state.google.email = who;
+        GCAL.clientKey = "";
+        save();
+      }
       var map = {};
       collectGcal(map, res[0].items, false);
       collectGcal(map, res[1].items, true);
-      Object.keys(map).forEach(function(d){
-        map[d].sort(function(a,b){
-          if(a.holiday !== b.holiday) return a.holiday ? -1 : 1;
-          return a.start - b.start;
-        });
-      });
-      GCAL.events = map;
-      GCAL.lastFetch = Date.now();
-      GCAL.retried = false;
-      renderCalendar(); renderHome();
+      applyEventMap(map);
     }).catch(function(e){
       if(e && e.auth){
+        /* no popup from here: the button turns into "다시 연결" instead */
         GCAL.token = null;
+        GCAL.expired = true;
         renderGcalBtn();
-        if(!GCAL.retried && gcalActive()){ GCAL.retried = true; gcalConnect(true); }
         return;
       }
-      toast("Google 일정을 불러오지 못했어요");
+      gcalWarn("Google 일정을 불러오지 못했어요");
     });
   }
 
-  function gcalActive(){
-    return !!gcalClientId() && !!(state.google && state.google.autoConnect);
+  /* Apps Script proxy: plain GET, no token, so timers may call it freely. */
+  function fetchProxyMonth(){
+    var url = gcalProxyUrl();
+    if(!url) return;
+    var r = monthRange();
+    var q = (url.indexOf("?") > -1 ? "&" : "?")
+      + "from=" + encodeURIComponent(r[0])
+      + "&to=" + encodeURIComponent(r[1]);
+    fetch(url + q)
+      .then(function(res){
+        if(!res.ok) throw new Error("http " + res.status);
+        return res.json();
+      })
+      .then(function(data){
+        if(!data || data.error) throw new Error((data && data.error) || "bad response");
+        var map = {};
+        collectGcal(map, data.items, false);
+        collectGcal(map, data.holidays, true);
+        applyEventMap(map);
+      })
+      .catch(function(){
+        gcalWarn("캘린더 주소에서 일정을 받지 못했어요. 설정의 주소를 확인해주세요");
+      });
   }
 
-  /* Keeps the overlay current without the user touching anything: poll while
-     visible, refetch on tab focus, and renew the token before it lapses. */
+  function loadCalendarSource(){
+    if(gcalProxyUrl()) fetchProxyMonth();
+    else if(GCAL.token) fetchGcalMonth();
+  }
+
+  /* Never opens a popup. With the proxy this keeps everything current on its
+     own; on OAuth it refreshes while the token lives and then just flags the
+     button, because a silent renew would be popup-blocked here. */
   function refreshGcal(){
-    if(!gcalActive() || document.hidden) return;
-    if(GCAL.token && (Date.now() - GCAL.tokenAt) < GCAL_TOKEN_TTL) fetchGcalMonth();
-    else gcalConnect(true);
+    if(document.hidden) return;
+    if(gcalProxyUrl()){ fetchProxyMonth(); return; }
+    if(!gcalActive()) return;
+    if(GCAL.token && (Date.now() - GCAL.tokenAt) < GCAL_TOKEN_TTL){
+      fetchGcalMonth();
+    } else if(GCAL.token){
+      GCAL.token = null;
+      GCAL.expired = true;
+      renderGcalBtn();
+    }
   }
 
   setInterval(refreshGcal, GCAL_POLL_MS);
@@ -421,7 +524,8 @@
   window.addEventListener("online", refreshGcal);
 
   document.getElementById("gcalBtn").addEventListener("click", function(){
-    if(GCAL.token) gcalDisconnect(); else gcalConnect(false);
+    if(gcalProxyUrl()){ openSettings(); return; }
+    if(GCAL.token) gcalDisconnect(); else gcalConnect();
   });
 
   /* ---------- Calendar ---------- */
@@ -516,7 +620,7 @@
   function goMonth(y, m){
     calCursor = new Date(y, m, 1);
     renderCalendar();
-    fetchGcalMonth();
+    loadCalendarSource();
   }
 
   document.getElementById("calGrid").addEventListener("click", function(e){
@@ -1014,7 +1118,14 @@
   renderDows();
   renderCalendar();
   renderGcalBtn();
-  if(gcalClientId() && state.google && state.google.autoConnect){ gcalConnect(true); }
+  if(gcalProxyUrl()){
+    fetchProxyMonth();
+  } else if(gcalActive() && !GCAL.triedOnLoad){
+    /* one silent attempt per load. If the browser blocks the popup the button
+       simply reads "다시 연결" — we never retry on a timer. */
+    GCAL.triedOnLoad = true;
+    gcalConnect();
+  }
   renderJournal();
   renderNotes();
   renderBookmarks();
